@@ -3,39 +3,36 @@ package io.ebean.redisson;
 import org.redisson.api.RMapCache;
 import org.redisson.api.RMapCacheNative;
 import org.redisson.api.RedissonClient;
-import org.redisson.api.redisnode.*;
+import org.redisson.api.redisnode.RedisClusterMaster;
+import org.redisson.api.redisnode.RedisMaster;
+import org.redisson.api.redisnode.RedisNode;
+import org.redisson.api.redisnode.RedisNodes;
+import org.redisson.client.codec.Codec;
 
 import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
 
-public class RMapCachingWrapper implements Map<byte[], byte[]> {
+public class RMapCachingWrapper<K, V> implements Map<K, V> {
 
     private static final String MINIMAL_CACHE_NATIVE_VERSION = "7.4.0";
 
-    private RMapCacheNative<byte[], byte[]> mapCacheNative;
-    private RMapCache<byte[], byte[]> mapCache;
+    private RMapCacheNative<K, V> mapCacheNative;
+    private RMapCache<K, V> mapCache;
 
     private RMapCachingWrapper() {}
 
-    public static RMapCachingWrapper create(RedissonClient client, String name) {
+    public static <K, V> RMapCachingWrapper<K, V> create(RedissonClient client, String name, Codec codec) {
         boolean nativeCache = isRedisVersionAtLeast(client, MINIMAL_CACHE_NATIVE_VERSION);
-        RMapCachingWrapper wrapper = new RMapCachingWrapper();
+        RMapCachingWrapper<K, V> wrapper = new RMapCachingWrapper<>();
 
         if (nativeCache) {
-            wrapper.mapCacheNative = client.getMapCacheNative(name);
+            wrapper.mapCacheNative = client.getMapCacheNative(name, codec);
         } else {
-            wrapper.mapCache = client.getMapCache(name);
+            wrapper.mapCache = client.getMapCache(name, codec);
         }
 
         return wrapper;
-    }
-
-    private Map<byte[], byte[]> getMap() {
-        if (mapCacheNative != null) {
-            return mapCacheNative;
-        }
-        return mapCache;
     }
 
     public static boolean isRedisVersionAtLeast(RedissonClient client, String minimumVersion) {
@@ -44,7 +41,7 @@ public class RMapCachingWrapper implements Map<byte[], byte[]> {
     }
 
     /**
-     * Compares two semantic versions (e.g., "7.4.0" vs "7.2.5").
+     * Compares two semantic versions (e.g., "7.4.0" vs. "7.2.5").
      *
      * @return negative if v1 < v2, zero if equal, positive if v1 > v2
      */
@@ -110,7 +107,7 @@ public class RMapCachingWrapper implements Map<byte[], byte[]> {
             try {
                 List<RedisClusterMaster> clusters = new ArrayList<>(client.getRedisNodes(RedisNodes.CLUSTER).getMasters());
                 if (!clusters.isEmpty()) {
-                    RedisClusterMaster masterNode = clusters.getFirst();
+                    RedisClusterMaster masterNode = clusters.get(0);
                     version = extractVersion(masterNode.info(RedisNode.InfoSection.SERVER));
                 }
             } catch (Exception ignored) {}
@@ -125,79 +122,86 @@ public class RMapCachingWrapper implements Map<byte[], byte[]> {
         return Optional.ofNullable(info.get("redis_version"));
     }
 
+    private Map<K, V> getMap() {
+        if (mapCacheNative != null) {
+            return mapCacheNative;
+        }
+        return mapCache;
+    }
+
     @Override
     public int size() {
-        Map<byte[], byte[]> map = getMap();
+        Map<K, V> map = getMap();
         return map.size();
     }
 
     @Override
     public boolean isEmpty() {
-        Map<byte[], byte[]> map = getMap();
+        Map<K, V> map = getMap();
         return map.isEmpty();
     }
 
     @Override
     public boolean containsKey(Object key) {
-        Map<byte[], byte[]> map = getMap();
+        Map<K, V> map = getMap();
         return map.containsKey(key);
     }
 
     @Override
     public boolean containsValue(Object value) {
-        Map<byte[], byte[]> map = getMap();
+        Map<K, V> map = getMap();
         return map.containsValue(value);
     }
 
     @Override
-    public byte[] get(Object key) {
-        Map<byte[], byte[]> map = getMap();
+    public V get(Object key) {
+        Map<K, V> map = getMap();
         return map.get(key);
     }
 
     @Override
-    public byte[] put(byte[] key, byte[] value) {
-        Map<byte[], byte[]> map = getMap();
+    public V put(K key, V value) {
+        Map<K, V> map = getMap();
         return map.put(key, value);
     }
 
     @Override
-    public byte[] remove(Object key) {
-        Map<byte[], byte[]> map = getMap();
+    public V remove(Object key) {
+        Map<K, V> map = getMap();
         return map.remove(key);
     }
 
     @Override
-    public void putAll(Map<? extends byte[], ? extends byte[]> m) {
-        Map<byte[], byte[]> map = getMap();
+    public void putAll(Map<? extends K, ? extends V> m) {
+        Map<K, V> map = getMap();
         map.putAll(m);
     }
 
     @Override
     public void clear() {
-        Map<byte[], byte[]> map = getMap();
+        Map<K, V> map = getMap();
         map.clear();
     }
 
     @Override
-    public Set<byte[]> keySet() {
-        Map<byte[], byte[]> map = getMap();
+    public Set<K> keySet() {
+        Map<K, V> map = getMap();
         return map.keySet();
     }
 
     @Override
-    public Collection<byte[]> values() {
-        Map<byte[], byte[]> map = getMap();
+    public Collection<V> values() {
+        Map<K, V> map = getMap();
         return map.values();
     }
 
     @Override
-    public Set<Entry<byte[], byte[]>> entrySet() {
-        Map<byte[], byte[]> map = getMap();
+    public Set<Entry<K, V>> entrySet() {
+        Map<K, V> map = getMap();
         return map.entrySet();
     }
 
-    public byte[] put(byte[] key, byte[] value, Duration expiration) {
+    public V put(K key, V value, Duration expiration) {
         if (mapCacheNative != null) {
             return mapCacheNative.put(key, value, expiration);
         } else {
@@ -205,7 +209,7 @@ public class RMapCachingWrapper implements Map<byte[], byte[]> {
         }
     }
 
-    public byte[] putIfAbsent(byte[] key, byte[] value, Duration expiration) {
+    public V putIfAbsent(K key, V value, Duration expiration) {
         if (mapCacheNative != null) {
             return mapCacheNative.putIfAbsent(key, value, expiration);
         } else {
@@ -213,7 +217,7 @@ public class RMapCachingWrapper implements Map<byte[], byte[]> {
         }
     }
 
-    public void putAll(Map<? extends byte[], ? extends byte[]> m, Duration expiration) {
+    public void putAll(Map<? extends K, ? extends V> m, Duration expiration) {
         if (mapCacheNative != null) {
             mapCacheNative.putAll(m, expiration);
         } else {
@@ -221,8 +225,8 @@ public class RMapCachingWrapper implements Map<byte[], byte[]> {
         }
     }
 
-    public Map<byte[], byte[]> getAll(Collection<byte[]> keys) {
-        Set<byte[]> keySet = new HashSet<>(keys);
+    public Map<K, V> getAll(Collection<K> keys) {
+        Set<K> keySet = new HashSet<>(keys);
         if (mapCacheNative != null) {
             return mapCacheNative.getAll(keySet);
         } else {
@@ -230,11 +234,13 @@ public class RMapCachingWrapper implements Map<byte[], byte[]> {
         }
     }
 
-    public void removeAll(Collection<byte[]> keys) {
+    public void removeAll(Collection<K> keys) {
+        @SuppressWarnings("unchecked")
+        K[] array = (K[]) keys.toArray(new Object[0]);
         if (mapCacheNative != null) {
-            mapCacheNative.fastRemove(keys.toArray(byte[][]::new));
+            mapCacheNative.fastRemove(array);
         } else {
-            mapCache.fastRemove(keys.toArray(byte[][]::new));
+            mapCache.fastRemove(array);
         }
     }
 }

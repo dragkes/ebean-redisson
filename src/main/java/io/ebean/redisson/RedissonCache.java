@@ -5,19 +5,18 @@ import io.ebean.cache.ServerCache;
 import io.ebean.cache.ServerCacheConfig;
 import io.ebean.cache.ServerCacheOptions;
 import io.ebean.cache.ServerCacheStatistics;
-import io.ebean.redisson.encode.Encode;
-import io.ebean.redisson.encode.EncodePrefixKey;
 import io.ebean.meta.MetricVisitor;
 import io.ebean.metric.CountMetric;
 import io.ebean.metric.MetricFactory;
 import io.ebean.metric.TimedMetric;
 import io.ebean.metric.TimedMetricStats;
 import org.redisson.api.RedissonClient;
+import org.redisson.client.codec.Codec;
 
 import java.time.Duration;
 import java.util.*;
+import java.util.stream.Collectors;
 
-import static java.lang.System.Logger.Level.ERROR;
 import static java.lang.System.Logger.Level.WARNING;
 
 public class RedissonCache implements ServerCache {
@@ -25,12 +24,9 @@ public class RedissonCache implements ServerCache {
     private static final System.Logger log = AppLog.getLogger(RedissonCache.class);
 
     private static final String CACHE_KEY_PREFIX = "EBEAN_CACHE";
-
-    private final RMapCachingWrapper cacheMap;
-    private final String cacheKey;
-    private final EncodePrefixKey keyEncode;
-    private final Encode valueEncode;
     private final Duration expiration;
+    private final RMapCachingWrapper<String, Object> cacheMap;
+    private final String cacheKey;
     private final TimedMetric metricGet;
     private final TimedMetric metricGetAll;
     private final TimedMetric metricPut;
@@ -41,10 +37,8 @@ public class RedissonCache implements ServerCache {
     private final CountMetric hitCount;
     private final CountMetric missCount;
 
-    RedissonCache(RedissonClient redissonClient, ServerCacheConfig config, Encode valueEncode) {
+    RedissonCache(RedissonClient redissonClient, ServerCacheConfig config, Codec codec) {
         this.cacheKey = config.getCacheKey();
-        this.keyEncode = new EncodePrefixKey(config.getCacheKey());
-        this.valueEncode = valueEncode;
         this.expiration = expiration(config);
         String namePrefix = "l2r." + config.getShortName();
         MetricFactory factory = MetricFactory.get();
@@ -57,7 +51,7 @@ public class RedissonCache implements ServerCache {
         metricRemove = factory.createTimedMetric(namePrefix + ".remove");
         metricRemoveAll = factory.createTimedMetric(namePrefix + ".removeMany");
         metricClear = factory.createTimedMetric(namePrefix + ".clear");
-        cacheMap = RMapCachingWrapper.create(redissonClient, CACHE_KEY_PREFIX + ":" + cacheKey);
+        cacheMap = RMapCachingWrapper.create(redissonClient, CACHE_KEY_PREFIX + ":" + cacheKey, codec);
     }
 
     private Duration expiration(ServerCacheConfig config) {
@@ -84,35 +78,6 @@ public class RedissonCache implements ServerCache {
         metricClear.visit(visitor);
     }
 
-    private byte[] key(Object id) {
-        return keyEncode.encode(id);
-    }
-
-    private byte[] value(Object data) {
-        if (data == null) {
-            return null;
-        }
-        return valueEncode.encode(data);
-    }
-
-    private Object valueDecode(byte[] data) {
-        try {
-            if (data == null) {
-                return null;
-            }
-            return valueEncode.decode(data);
-        } catch (Exception e) {
-            log.log(ERROR, "Error decoding data, treated as cache miss", e);
-            return null;
-        }
-    }
-
-    private List<byte[]> keysAsBytes(Collection<Object> keys) {
-        return keys.stream()
-            .map(this::key)
-            .toList();
-    }
-
     private void errorOnRead(Exception e) {
         log.log(WARNING, "Error when reading redis cache", e);
     }
@@ -128,14 +93,13 @@ public class RedissonCache implements ServerCache {
                 return Collections.emptyMap();
             }
             long start = System.nanoTime();
-            List<Object> keyList = new ArrayList<>(keys);
+            List<String> keyList = keys.stream().map(Object::toString).collect(Collectors.toList());
             Map<Object, Object> map = new LinkedHashMap<>();
-            List<byte[]> keysBytes = keysAsBytes(keys);
-            Map<byte[], byte[]> values = cacheMap.getAll(keysBytes);
-            for (int i = 0; i < keysBytes.size(); i++) {
-                byte[] key = keysBytes.get(i);
+            Map<String, Object> values = cacheMap.getAll(keyList);
+            for (int i = 0; i < keys.size(); i++) {
+                String key = keyList.get(i);
                 if (values.containsKey(key)) {
-                    map.put(keyList.get(i), valueDecode(values.get(key)));
+                    map.put(keyList.get(i), values.get(key));
                 }
             }
             int hits = map.size();
@@ -159,14 +123,14 @@ public class RedissonCache implements ServerCache {
     public Object get(Object id) {
         long start = System.nanoTime();
         try {
-            byte[] val = cacheMap.get(key(id));
+            Object val = cacheMap.get(id.toString());
             if (val != null) {
                 hitCount.increment();
             } else {
                 missCount.increment();
             }
             metricGet.addSinceNanos(start);
-            return valueDecode(val);
+            return val;
         } catch (Exception e) {
             errorOnRead(e);
             return null;
@@ -178,10 +142,10 @@ public class RedissonCache implements ServerCache {
         long start = System.nanoTime();
         try {
             if (expiration == null) {
-                cacheMap.put(key(id), value(value));
+                cacheMap.put(id.toString(), value);
             } else {
                 // Set with expiration
-                cacheMap.put(key(id), value(value), expiration);
+                cacheMap.put(id.toString(), value, expiration);
             }
             metricPut.addSinceNanos(start);
         } catch (Exception e) {
@@ -192,16 +156,16 @@ public class RedissonCache implements ServerCache {
     @Override
     public void putAll(Map<Object, Object> keyValues) {
         long start = System.nanoTime();
-        Map<byte[], byte[]> values = new HashMap<>();
-        for (var entry : keyValues.entrySet()) {
-            values.put(key(entry.getKey()), value(entry.getValue()));
-        }
         try {
+            Map<String, Object> map = new LinkedHashMap<>();
+            for (Map.Entry<Object, Object> entry : keyValues.entrySet()) {
+                map.put(entry.getKey().toString(), entry.getValue());
+            }
             if (expiration == null) {
                 // Simple putAll without expiration
-                cacheMap.putAll(values);
+                cacheMap.putAll(map);
             } else {
-                cacheMap.putAll(values, expiration);
+                cacheMap.putAll(map, expiration);
             }
             metricPutAll.addSinceNanos(start);
         } catch (Exception e) {
@@ -213,7 +177,7 @@ public class RedissonCache implements ServerCache {
     public void remove(Object id) {
         long start = System.nanoTime();
         try {
-            cacheMap.remove(key(id));
+            cacheMap.remove(id.toString());
             metricRemove.addSinceNanos(start);
         } catch (Exception e) {
             errorOnWrite(e);
@@ -224,7 +188,8 @@ public class RedissonCache implements ServerCache {
     public void removeAll(Set<Object> keys) {
         long start = System.nanoTime();
         try {
-            cacheMap.removeAll(keysAsBytes(keys));
+            List<String> keyList = keys.stream().map(Object::toString).collect(Collectors.toList());
+            cacheMap.removeAll(keyList);
             metricRemoveAll.addSinceNanos(start);
         } catch (Exception e) {
             errorOnWrite(e);
@@ -242,11 +207,9 @@ public class RedissonCache implements ServerCache {
         }
     }
 
-
     public long getHitCount() {
         return hitCount.get(false);
     }
-
 
     public long getMissCount() {
         return missCount.get(false);
@@ -267,5 +230,4 @@ public class RedissonCache implements ServerCache {
     private long count(TimedMetricStats stats) {
         return stats == null ? 0 : stats.count();
     }
-
 }

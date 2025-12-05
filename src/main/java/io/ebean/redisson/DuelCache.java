@@ -56,7 +56,7 @@ public final class DuelCache implements ServerCache, NearCacheInvalidate {
             }
         }
         if (!remainingKeys.isEmpty()) {
-            // fetch missing ones from remote cache and merge results
+            // fetch missing ones from a remote cache and merge results
             Map<Object, Object> remoteMap = remote.getAll(remainingKeys);
             if (!remoteMap.isEmpty()) {
                 near.putAll(remoteMap);
