@@ -1,0 +1,1 @@
+[Ebean](https://github.com/ebean-orm/ebean) L2 Cache implementation with [Redisson](https://github.com/redisson/redisson)
