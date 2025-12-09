@@ -18,7 +18,7 @@ import io.ebeaninternal.server.cache.DefaultServerCache;
 import io.ebeaninternal.server.cache.DefaultServerCacheConfig;
 import io.ebeaninternal.server.cache.DefaultServerQueryCache;
 import org.redisson.Redisson;
-import org.redisson.api.RTopic;
+import org.redisson.api.RReliableTopic;
 import org.redisson.api.RedissonClient;
 import org.redisson.config.Config;
 
@@ -188,7 +188,7 @@ public class RedissonCacheFactory implements ServerCacheFactory {
             message.setServerId(serverId);
             message.setKey(name);
 
-            RTopic topic = redissonClient.getTopic(CHANNEL_L2);
+            RReliableTopic topic = redissonClient.getReliableTopic(CHANNEL_L2);
             topic.publish(message);
         } finally {
             metricOutQueryCache.addSinceNanos(nanos);
@@ -203,7 +203,7 @@ public class RedissonCacheFactory implements ServerCacheFactory {
             message.setTables(dependentTables);
             message.setServerId(serverId);
 
-            RTopic topic = redissonClient.getTopic(CHANNEL_L2);
+            RReliableTopic topic = redissonClient.getReliableTopic(CHANNEL_L2);
             topic.publish(message);
         } finally {
             metricOutTableMod.addSinceNanos(nanos);
@@ -349,8 +349,8 @@ public class RedissonCacheFactory implements ServerCacheFactory {
     }
 
     private void subscribeToMessages(RedissonClient redissonClient) {
-        RTopic topicL2 = redissonClient.getTopic(CHANNEL_L2);
-        RTopic topicNear = redissonClient.getTopic(CHANNEL_NEAR);
+        RReliableTopic topicL2 = redissonClient.getReliableTopic(CHANNEL_L2);
+        RReliableTopic topicNear = redissonClient.getReliableTopic(CHANNEL_NEAR);
 
         topicL2.addListener(L2QueryInvalidMessage.class, (channel, message) -> {
             queryCacheInvalidate(message);
@@ -464,7 +464,7 @@ public class RedissonCacheFactory implements ServerCacheFactory {
         private void sendMessage(NearMessage message) {
             long nanos = System.nanoTime();
             try {
-                RTopic topic = redissonClient.getTopic(CHANNEL_NEAR);
+                RReliableTopic topic = redissonClient.getReliableTopic(CHANNEL_NEAR);
                 topic.publish(message);
             } finally {
                 metricOutNearCache.addSinceNanos(nanos);

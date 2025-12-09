@@ -9,6 +9,5 @@ open module io.ebean.redisson {
 
   requires transitive io.ebean.core;
   requires transitive redisson;
-    requires io.netty.buffer;
-
+  requires io.netty.buffer;
 }
