@@ -3,18 +3,19 @@ package io.ebean.redisson;
 import io.avaje.applog.AppLog;
 import io.ebean.cache.ServerCache;
 import io.ebean.cache.ServerCacheConfig;
-import io.ebean.cache.ServerCacheOptions;
 import io.ebean.cache.ServerCacheStatistics;
 import io.ebean.meta.MetricVisitor;
 import io.ebean.metric.CountMetric;
 import io.ebean.metric.MetricFactory;
 import io.ebean.metric.TimedMetric;
 import io.ebean.metric.TimedMetricStats;
+import org.redisson.api.EvictionMode;
+import org.redisson.api.RMapCache;
 import org.redisson.api.RedissonClient;
 import org.redisson.client.codec.Codec;
 
-import java.time.Duration;
 import java.util.*;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 import static java.lang.System.Logger.Level.WARNING;
@@ -24,8 +25,9 @@ public class RedissonCache implements ServerCache {
     private static final System.Logger log = AppLog.getLogger(RedissonCache.class);
 
     private static final String CACHE_KEY_PREFIX = "EBEAN_CACHE";
-    private final Duration expiration;
-    private final RMapCachingWrapper<String, Object> cacheMap;
+    private final int maxIdleSecs;
+    private final int maxSecsToLive;
+    private final RMapCache<String, Object> cacheMap;
     private final String cacheKey;
     private final TimedMetric metricGet;
     private final TimedMetric metricGetAll;
@@ -39,7 +41,13 @@ public class RedissonCache implements ServerCache {
 
     RedissonCache(RedissonClient redissonClient, ServerCacheConfig config, Codec codec) {
         this.cacheKey = config.getCacheKey();
-        this.expiration = expiration(config);
+
+        int maxSecsToLive = config.getCacheOptions().getMaxSecsToLive();
+        this.maxSecsToLive = Math.max(maxSecsToLive, 0);
+        int maxIdleSecs = config.getCacheOptions().getMaxIdleSecs();
+        this.maxIdleSecs = Math.max(maxIdleSecs, 0);
+        int maxSize = config.getCacheOptions().getMaxSize();
+
         String namePrefix = "l2r." + config.getShortName();
         MetricFactory factory = MetricFactory.get();
         hitCount = factory.createCountMetric(namePrefix + ".hit");
@@ -51,18 +59,11 @@ public class RedissonCache implements ServerCache {
         metricRemove = factory.createTimedMetric(namePrefix + ".remove");
         metricRemoveAll = factory.createTimedMetric(namePrefix + ".removeMany");
         metricClear = factory.createTimedMetric(namePrefix + ".clear");
-        cacheMap = RMapCachingWrapper.create(redissonClient, CACHE_KEY_PREFIX + ":" + cacheKey, codec);
-    }
+        cacheMap = redissonClient.getMapCache(CACHE_KEY_PREFIX + ":" + cacheKey, codec);
 
-    private Duration expiration(ServerCacheConfig config) {
-        final ServerCacheOptions cacheOptions = config.getCacheOptions();
-        if (cacheOptions != null) {
-            final int maxSecsToLive = cacheOptions.getMaxSecsToLive();
-            if (maxSecsToLive > 0) {
-                return Duration.ofSeconds(maxSecsToLive);
-            }
+        if (maxSize > 0) {
+            cacheMap.setMaxSize(maxSize, EvictionMode.LFU);
         }
-        return null;
     }
 
     @Override
@@ -80,6 +81,7 @@ public class RedissonCache implements ServerCache {
 
     private void errorOnRead(Exception e) {
         log.log(WARNING, "Error when reading redis cache", e);
+        clear();
     }
 
     private void errorOnWrite(Exception e) {
@@ -95,7 +97,7 @@ public class RedissonCache implements ServerCache {
             long start = System.nanoTime();
             List<String> keyList = keys.stream().map(Object::toString).collect(Collectors.toList());
             Map<Object, Object> map = new LinkedHashMap<>();
-            Map<String, Object> values = cacheMap.getAll(keyList);
+            Map<String, Object> values = cacheMap.getAll(new HashSet<>(keyList));
             for (int i = 0; i < keys.size(); i++) {
                 String key = keyList.get(i);
                 if (values.containsKey(key)) {
@@ -141,12 +143,7 @@ public class RedissonCache implements ServerCache {
     public void put(Object id, Object value) {
         long start = System.nanoTime();
         try {
-            if (expiration == null) {
-                cacheMap.put(id.toString(), value);
-            } else {
-                // Set with expiration
-                cacheMap.put(id.toString(), value, expiration);
-            }
+            cacheMap.put(id.toString(), value, maxSecsToLive, TimeUnit.SECONDS, maxIdleSecs, TimeUnit.SECONDS);
             metricPut.addSinceNanos(start);
         } catch (Exception e) {
             errorOnWrite(e);
@@ -161,11 +158,12 @@ public class RedissonCache implements ServerCache {
             for (Map.Entry<Object, Object> entry : keyValues.entrySet()) {
                 map.put(entry.getKey().toString(), entry.getValue());
             }
-            if (expiration == null) {
-                // Simple putAll without expiration
-                cacheMap.putAll(map);
+            if (maxIdleSecs == 0) {
+                cacheMap.putAll(map, maxSecsToLive, TimeUnit.SECONDS);
             } else {
-                cacheMap.putAll(map, expiration);
+                for (Map.Entry<String, Object> entry : map.entrySet()) {
+                    cacheMap.put(entry.getKey(), entry.getValue(), maxSecsToLive, TimeUnit.SECONDS, maxIdleSecs, TimeUnit.SECONDS);
+                }
             }
             metricPutAll.addSinceNanos(start);
         } catch (Exception e) {
@@ -188,8 +186,8 @@ public class RedissonCache implements ServerCache {
     public void removeAll(Set<Object> keys) {
         long start = System.nanoTime();
         try {
-            List<String> keyList = keys.stream().map(Object::toString).collect(Collectors.toList());
-            cacheMap.removeAll(keyList);
+            var keysArray = keys.stream().map(Object::toString).toArray(String[]::new);
+            cacheMap.fastRemove(keysArray);
             metricRemoveAll.addSinceNanos(start);
         } catch (Exception e) {
             errorOnWrite(e);
