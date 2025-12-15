@@ -405,6 +405,7 @@ public class RedissonCacheFactory implements ServerCacheFactory {
         public void notify(ServerCacheNotification tableModifications) {
             Set<String> dependentTables = tableModifications.getDependentTables();
             if (dependentTables != null && !dependentTables.isEmpty()) {
+                listener.notify(new ServerCacheNotification(dependentTables));
                 sendTableMod(dependentTables);
             }
         }
