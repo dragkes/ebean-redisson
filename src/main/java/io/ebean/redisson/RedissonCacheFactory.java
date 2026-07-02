@@ -12,6 +12,7 @@ import io.ebean.redisson.dto.*;
 import io.ebean.redisson.encode.CachedBeanDataCodec;
 import io.ebean.redisson.encode.CachedManyIdsCodec;
 import io.ebean.redisson.encode.SerializableCodec;
+import io.ebean.redisson.encode.VersionGatedCodec;
 import io.ebean.redisson.near.NearCacheInvalidate;
 import io.ebean.redisson.near.NearCacheNotify;
 import io.ebeaninternal.server.cache.DefaultServerCache;
@@ -20,6 +21,7 @@ import io.ebeaninternal.server.cache.DefaultServerQueryCache;
 import org.redisson.Redisson;
 import org.redisson.api.RReliableTopic;
 import org.redisson.api.RedissonClient;
+import org.redisson.client.codec.Codec;
 import org.redisson.config.Config;
 
 import java.io.*;
@@ -34,17 +36,18 @@ import static java.lang.System.Logger.Level.*;
 public class RedissonCacheFactory implements ServerCacheFactory {
 
     private static final System.Logger log = AppLog.getLogger(RedissonCacheFactory.class);
-
     /**
      * Channel for standard L2 cache messages.
      */
     private static final String CHANNEL_L2 = "ebean.l2cache";
-
     /**
      * Channel specifically for near cache invalidation messages.
      */
     private static final String CHANNEL_NEAR = "ebean.l2near";
-
+    /**
+     * Memoised per-region "does the bean have an @Version" (drives version-gating), keyed by cacheKey.
+     */
+    private final Map<String, Boolean> versionedByCacheKey = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, RQueryCache> queryCaches = new ConcurrentHashMap<>();
     private final Map<String, NearCacheInvalidate> nearCacheMap = new ConcurrentHashMap<>();
     private final SerializableCodec serializableCodec = new SerializableCodec();
@@ -61,6 +64,8 @@ public class RedissonCacheFactory implements ServerCacheFactory {
     private final TimedMetric metricInQueryCache;
     private final String serverId = ModId.id();
     private final ReentrantLock lock = new ReentrantLock();
+    private final RReliableTopic topicL2;
+    private final RReliableTopic topicNear;
     private ServerCacheNotify listener;
 
     RedissonCacheFactory(DatabaseBuilder.Settings config, BackgroundExecutor executor) {
@@ -74,7 +79,25 @@ public class RedissonCacheFactory implements ServerCacheFactory {
         this.metricInQueryCache = factory.createTimedMetric("l2a.inQueryCache");
         this.metricInNearCache = factory.createTimedMetric("l2a.inNearKeys");
         this.redissonClient = getRedissonClient(config);
-        subscribeToMessages(redissonClient);
+        this.topicL2 = redissonClient.getReliableTopic(CHANNEL_L2);
+        this.topicNear = redissonClient.getReliableTopic(CHANNEL_NEAR);
+        subscribeToMessages();
+    }
+
+    private static boolean hasVersionProperty(Class<?> beanType) {
+        for (Class<?> c = beanType; c != null && c != Object.class; c = c.getSuperclass()) {
+            for (java.lang.reflect.Field f : c.getDeclaredFields()) {
+                if (f.isAnnotationPresent(jakarta.persistence.Version.class)) {
+                    return true;
+                }
+            }
+            for (java.lang.reflect.Method m : c.getDeclaredMethods()) {
+                if (m.isAnnotationPresent(jakarta.persistence.Version.class)) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     private RedissonClient getRedissonClient(DatabaseBuilder.Settings config) {
@@ -99,7 +122,7 @@ public class RedissonCacheFactory implements ServerCacheFactory {
             } else {
                 log.log(WARNING, "redisson-config.yaml not found in classpath. Falling back to default config.");
             }
-        } catch (IOException | IllegalArgumentException e) {
+        } catch (IllegalArgumentException e) {
             log.log(WARNING, "Failed to load redisson-config.yaml from classpath. Falling back to default config.", e);
         }
 
@@ -111,7 +134,6 @@ public class RedissonCacheFactory implements ServerCacheFactory {
 
         return Redisson.create(loadedConfig);
     }
-
 
     @Override
     public void visit(MetricVisitor visitor) {
@@ -149,13 +171,53 @@ public class RedissonCacheFactory implements ServerCacheFactory {
     private RedissonCache createRedisCache(ServerCacheConfig config) {
         switch (config.getType()) {
             case NATURAL_KEY:
-                return new RedissonCache(redissonClient, config, serializableCodec);
-            case BEAN:
-                return new RedissonCache(redissonClient, config, cachedBeanDataCodec);
+                return new RedissonCache(redissonClient, config, serializableCodec, executor, false);
+            case BEAN: {
+                // Version-gate bean puts whenever the entity is versionable (has @Version):
+                // it's a single Lua CAS (one round trip) that stops a stale read-reload
+                // from regressing the shared remote to an older value - an inexpensive robustness win for every
+                // versioned bean. The version-gated cache stores an 8-byte version prefix for the Lua compare.
+                boolean versioned = isVersioned(config);
+                Codec beanCodec = versioned ? new VersionGatedCodec(cachedBeanDataCodec) : cachedBeanDataCodec;
+                return new RedissonCache(redissonClient, config, beanCodec, executor, versioned);
+            }
             case COLLECTION_IDS:
-                return new RedissonCache(redissonClient, config, cachedManyIdsCodec);
+                return new RedissonCache(redissonClient, config, cachedManyIdsCodec, executor, false);
             default:
                 throw new IllegalArgumentException("Unexpected cache type? " + config.getType());
+        }
+    }
+
+    /**
+     * Whether the bean has an {@code @Version} property (so version-gating the remote cache is meaningful).
+     * Memoised per cacheKey.
+     */
+    private boolean isVersioned(ServerCacheConfig config) {
+        return versionedByCacheKey.computeIfAbsent(config.getCacheKey(), k -> {
+            Class<?> beanType = resolveBeanType(config);
+            return beanType != null && hasVersionProperty(beanType);
+        });
+    }
+
+    /**
+     * Resolve the entity bean type from the cacheKey ({@code beanName + ServerCacheType.code()}, with an
+     * extra {@code .collectionProperty} segment for COLLECTION_IDS). Returns null if it can't be resolved.
+     */
+    private Class<?> resolveBeanType(ServerCacheConfig config) {
+        try {
+            String key = config.getCacheKey();
+            String code = config.getType().code();
+            String beanName = key.endsWith(code) ? key.substring(0, key.length() - code.length()) : key;
+            if (config.getType() == ServerCacheType.COLLECTION_IDS) {
+                int dot = beanName.lastIndexOf('.');
+                if (dot > 0) {
+                    beanName = beanName.substring(0, dot);
+                }
+            }
+            return Class.forName(beanName, false, Thread.currentThread().getContextClassLoader());
+        } catch (Throwable e) {
+            log.log(WARNING, "Could not resolve entity for cacheKey [" + config.getCacheKey() + "]", e);
+            return null;
         }
     }
 
@@ -188,8 +250,7 @@ public class RedissonCacheFactory implements ServerCacheFactory {
             message.setServerId(serverId);
             message.setKey(name);
 
-            RReliableTopic topic = redissonClient.getReliableTopic(CHANNEL_L2);
-            topic.publish(message);
+            topicL2.publish(message);
         } finally {
             metricOutQueryCache.addSinceNanos(nanos);
         }
@@ -203,8 +264,7 @@ public class RedissonCacheFactory implements ServerCacheFactory {
             message.setTables(dependentTables);
             message.setServerId(serverId);
 
-            RReliableTopic topic = redissonClient.getReliableTopic(CHANNEL_L2);
-            topic.publish(message);
+            topicL2.publish(message);
         } finally {
             metricOutTableMod.addSinceNanos(nanos);
         }
@@ -348,9 +408,7 @@ public class RedissonCacheFactory implements ServerCacheFactory {
         log.log(WARNING, "No near cache found for cacheKey [" + cacheKey + "] yet - probably on startup");
     }
 
-    private void subscribeToMessages(RedissonClient redissonClient) {
-        RReliableTopic topicL2 = redissonClient.getReliableTopic(CHANNEL_L2);
-        RReliableTopic topicNear = redissonClient.getReliableTopic(CHANNEL_NEAR);
+    private void subscribeToMessages() {
 
         topicL2.addListener(L2QueryInvalidMessage.class, (channel, message) -> {
             queryCacheInvalidate(message);
@@ -465,8 +523,7 @@ public class RedissonCacheFactory implements ServerCacheFactory {
         private void sendMessage(NearMessage message) {
             long nanos = System.nanoTime();
             try {
-                RReliableTopic topic = redissonClient.getReliableTopic(CHANNEL_NEAR);
-                topic.publish(message);
+                topicNear.publish(message);
             } finally {
                 metricOutNearCache.addSinceNanos(nanos);
             }

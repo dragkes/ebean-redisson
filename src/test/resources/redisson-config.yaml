@@ -8,7 +8,6 @@ singleServerConfig:
   connectTimeout: 3000
   timeout: 3000
   retryAttempts: 2
-  retryInterval: 1500
 
 threads: 4
 nettyThreads: 8
