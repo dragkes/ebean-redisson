@@ -21,7 +21,6 @@ import io.ebeaninternal.server.cache.DefaultServerQueryCache;
 import org.redisson.Redisson;
 import org.redisson.api.RReliableTopic;
 import org.redisson.api.RedissonClient;
-import org.redisson.client.codec.Codec;
 import org.redisson.config.Config;
 
 import java.io.*;
@@ -173,51 +172,13 @@ public class RedissonCacheFactory implements ServerCacheFactory {
             case NATURAL_KEY:
                 return new RedissonCache(redissonClient, config, serializableCodec, executor, false);
             case BEAN: {
-                // Version-gate bean puts whenever the entity is versionable (has @Version):
-                // it's a single Lua CAS (one round trip) that stops a stale read-reload
-                // from regressing the shared remote to an older value - an inexpensive robustness win for every
-                // versioned bean. The version-gated cache stores an 8-byte version prefix for the Lua compare.
-                boolean versioned = isVersioned(config);
-                Codec beanCodec = versioned ? new VersionGatedCodec(cachedBeanDataCodec) : cachedBeanDataCodec;
-                return new RedissonCache(redissonClient, config, beanCodec, executor, versioned);
+                VersionGatedCodec codec = new VersionGatedCodec(cachedBeanDataCodec);
+                return new RedissonCache(redissonClient, config, codec, executor, true);
             }
             case COLLECTION_IDS:
                 return new RedissonCache(redissonClient, config, cachedManyIdsCodec, executor, false);
             default:
                 throw new IllegalArgumentException("Unexpected cache type? " + config.getType());
-        }
-    }
-
-    /**
-     * Whether the bean has an {@code @Version} property (so version-gating the remote cache is meaningful).
-     * Memoised per cacheKey.
-     */
-    private boolean isVersioned(ServerCacheConfig config) {
-        return versionedByCacheKey.computeIfAbsent(config.getCacheKey(), k -> {
-            Class<?> beanType = resolveBeanType(config);
-            return beanType != null && hasVersionProperty(beanType);
-        });
-    }
-
-    /**
-     * Resolve the entity bean type from the cacheKey ({@code beanName + ServerCacheType.code()}, with an
-     * extra {@code .collectionProperty} segment for COLLECTION_IDS). Returns null if it can't be resolved.
-     */
-    private Class<?> resolveBeanType(ServerCacheConfig config) {
-        try {
-            String key = config.getCacheKey();
-            String code = config.getType().code();
-            String beanName = key.endsWith(code) ? key.substring(0, key.length() - code.length()) : key;
-            if (config.getType() == ServerCacheType.COLLECTION_IDS) {
-                int dot = beanName.lastIndexOf('.');
-                if (dot > 0) {
-                    beanName = beanName.substring(0, dot);
-                }
-            }
-            return Class.forName(beanName, false, Thread.currentThread().getContextClassLoader());
-        } catch (Throwable e) {
-            log.log(WARNING, "Could not resolve entity for cacheKey [" + config.getCacheKey() + "]", e);
-            return null;
         }
     }
 
